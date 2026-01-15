@@ -15,7 +15,7 @@ import os.path as osp
 from argparse import ArgumentParser, Namespace
 
 sys.path.append("./")
-from x2_gaussian.utils.argument_utils import ParamGroup
+from r2_gaussian.utils.argument_utils import ParamGroup
 
 
 class ModelParams(ParamGroup):
@@ -26,7 +26,11 @@ class ModelParams(ParamGroup):
         self.ply_path = ""  # Path to initialization point cloud (if None, we will try to find `init_*.npy`.)
         self.scale_min =  0.0  # percent of volume size  0.0005
         self.scale_max =  0.5  # percent of volume size
-        self.eval = True
+        self.eval = True  # True
+
+        self.v_grid_spacing = [8,8,8]
+        self.t_grid_spacing = 4
+        self.num_rank = 2
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -39,6 +43,9 @@ class PipelineParams(ParamGroup):
     def __init__(self, parser):
         self.compute_cov3D_python = False
         self.debug = False
+
+        self.unified = False
+        self.no_bspline = False
         super().__init__(parser, "Pipeline Parameters")
 
 
@@ -84,10 +91,18 @@ class OptimizationParams(ParamGroup):
         self.hf_weights_lr_final = 0.00002
         self.hf_weights_lr_max_steps = 30_000
 
+        self.v_grid_lr_init = 0.0001
+        self.v_grid_lr_final = 0.00001
+        self.v_grid_lr_max_steps = 30_000
+        self.t_grid_lr_init = 0.01
+        self.t_grid_lr_final = 0.001
+        self.t_grid_lr_max_steps = 30_000
+
         self.lambda_dssim = 0.25
         self.lambda_tv = 0.05
         self.lambda_prior = 1.0
         self.lambda_prior_3d = 0.01 # useless
+        self.lambda_fdk_3d = 1.5
         self.tv_vol_size = 32
         self.density_min_threshold = 0.00001
         self.densification_interval = 100

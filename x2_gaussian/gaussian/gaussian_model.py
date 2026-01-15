@@ -22,9 +22,9 @@ import torch.nn.functional as F
 sys.path.append("./")
 
 from simple_knn._C import distCUDA2
-from x2_gaussian.utils.general_utils import t2a
-from x2_gaussian.utils.system_utils import mkdir_p
-from x2_gaussian.utils.gaussian_utils import (
+from r2_gaussian.utils.general_utils import t2a
+from r2_gaussian.utils.system_utils import mkdir_p
+from r2_gaussian.utils.gaussian_utils import (
     inverse_sigmoid,
     get_expon_lr_func,
     build_rotation,
@@ -32,19 +32,46 @@ from x2_gaussian.utils.gaussian_utils import (
     strip_symmetric,
     build_scaling_rotation,
 )
-from x2_gaussian.gaussian.deformation import deform_network
-from x2_gaussian.gaussian.regulation import compute_plane_smoothness
+from r2_gaussian.gaussian.deformation import deform_network
+from r2_gaussian.gaussian.regulation import compute_plane_smoothness
+
+from ffd import FFD
 
 EPS = 1e-5
 
+class temporal_bspline(nn.Module):
+
+    def __init__(self,nt, grid_spacing_in_time_points):
+        super(temporal_bspline,self).__init__()
+        self.nc = int((nt-1)/grid_spacing_in_time_points)+4
+        self.dt = grid_spacing_in_time_points * 1/(nt-1)
+        self.helper_matrix = (1 / 6) * torch.tensor([[1, 4, 1, 0],
+                                                    [-3, 0, 3, 0],
+                                                    [3, -6, 3, 0],
+                                                    [-1, 3, -3, 1]]).cuda()
+    
+    def forward(self,t,grid):
+        m = torch.tensor(t / self.dt + 1.0).cuda().view(-1,1)
+        idx = torch.floor(m).long()
+        f = m - idx
+        h = self.helper_matrix @ grid[torch.cat([idx-1,idx,idx+1,idx+2],axis=-1).long(),:]
+        out = h[:,0] + f * h[:,1] + f**2 * h[:,2] + f**3 * h[:,3]
+        return out
 
 class GaussianModel:
     def setup_functions(self):
-        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation, jacobian, returnEigen=False):
             L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+            if jacobian is not None:
+                L = jacobian @ L
             actual_covariance = L @ L.transpose(1, 2)
             symm = strip_symmetric(actual_covariance)
-            return symm
+            if returnEigen:
+                with torch.no_grad():
+                    eigV = torch.linalg.eigvals(actual_covariance).abs().sqrt()
+                return symm,eigV
+            else:
+                return symm
 
         if self.scale_bound is not None:
             scale_min_bound, scale_max_bound = self.scale_bound
@@ -69,6 +96,9 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
+        self.t_basis_activation = lambda x: 2.0 * torch.sigmoid(x) - 1.0
+        self.t_basis_inverse_activation = lambda x: inverse_sigmoid((x+1.0)/2.0)
+
         # print(self.scale_bound,  scale_max_bound , scale_min_bound)
 
     def __init__(self, scale_bound=None, args=None):
@@ -87,6 +117,67 @@ class GaussianModel:
         self.period = torch.empty(0)
         self.t_seq = torch.linspace(0, args.kplanes_config['resolution'][3]-1, args.kplanes_config['resolution'][3]).cuda()
         self.setup_functions()
+
+        self.deformation_optimizer = None
+        self._v_grid = torch.empty(0)
+        self._t_grid = torch.empty(0)
+
+
+    def setup_v_grid(self, scanner_cfg, args, unified=True, bspline=True):
+        if bspline:
+            print("Using bspline free-form deformation...")
+        if unified:
+            print("using unified deformation for all attributes...")
+        self.unified = unified
+        self.bspline = bspline
+        if bspline:
+            if unified:
+                n_channels = 3
+                return_jacobian = True
+            else:
+                n_channels = 10
+                return_jacobian = False
+            self.DeformNetwork = FFD(scanner_cfg["nVoxel"],scanner_cfg["dVoxel"],args.v_grid_spacing, n_channels, return_jacobian)
+            v_grid_dim = self.DeformNetwork.grid_dim
+            self._v_grid = nn.Parameter(torch.zeros((v_grid_dim[0],v_grid_dim[1],v_grid_dim[2],n_channels,args.num_rank), device="cuda").float().requires_grad_(True))
+            # torch.Size([35, 35, 17, 10, 2])
+        else:
+            self._v_grid = nn.Parameter(torch.zeros((self._xyz.shape[0],10,args.num_rank), device="cuda").float().requires_grad_(True))
+    
+    def setup_t_grid(self, nt, args):
+        self.timeNet = temporal_bspline(nt, args.t_grid_spacing)
+        self._t_grid = nn.Parameter(torch.randn(self.timeNet.nc,args.num_rank).float().contiguous().cuda().requires_grad_(True))
+        # torch.Size([78, 2])
+        self.nt = nt
+
+
+    def deformation(self, xyz: torch.Tensor, t):
+        assert t>=0 and t<=1, "t must be in [0,1]"
+        if self.bspline:
+            grid = self._v_grid * self.t_basis_activation(self.timeNet(t,self._t_grid)).view(1,1,1,1,-1)   # torch.Size([35, 35, 17, 10, 2])
+            # self._v_grid  torch.Size([35, 35, 17, 10, 2])
+            # self.t_basis_activation(self.timeNet(t,self._t_grid))  torch.Size([1, 2])
+            # self._v_grid * self.t_basis_activation(self.timeNet(t,self._t_grid))   torch.Size([35, 35, 17, 10, 2])
+            # breakpoint()
+            if self.unified:
+                if xyz.isnan().any():
+                    print("nan in xyz")
+                displacement, jacobian = self.DeformNetwork(xyz.contiguous(), grid.sum(-1).contiguous())
+                if jacobian.isnan().any():
+                    print("nan in jacobian")
+                if displacement.isnan().any():
+                    print("nan in displacement")
+                return xyz+displacement, jacobian
+            else:
+                delta = self.DeformNetwork(xyz.contiguous(), grid.sum(-1).contiguous())
+                return delta
+        else:
+            delta = self._v_grid * self.t_basis_activation(self.timeNet(t,self._t_grid)).view(1,1,-1)
+            return delta.sum(dim=-1).contiguous()
+
+
+
+
 
     def capture(self):
         return (
@@ -143,16 +234,22 @@ class GaussianModel:
     @property
     def get_density(self):
         return self.density_activation(self._density)
+    
+    @property
+    def get_v_grid(self):
+        return self._v_grid
 
-    def get_covariance(self, scaling_modifier=1):
+    def get_covariance(self, scaling_modifier=1, jacobian = None, returnEigen=False):
         return self.covariance_activation(
-            self.get_scaling, scaling_modifier, self._rotation
+            self.get_scaling, scaling_modifier, self._rotation, jacobian, returnEigen
         )
     
     def parameters(self):
         module_params = [self._xyz, self._scaling, self._rotation, self._density]
         module_params.extend(self._deformation.parameters())
         module_params.extend(self.period)
+        module_params.extend(self._v_grid)
+        module_params.extend(self._t_grid)
 
         return module_params
 
@@ -253,6 +350,26 @@ class GaussianModel:
         ]
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
+
+        self.deformation_optimizer = torch.optim.Adam(
+            [
+                {
+                    "params": [self._v_grid],
+                    "lr": training_args.v_grid_lr_init * self.spatial_lr_scale,
+                    "name": "v_grid",
+                },
+                {
+                    "params": [self._t_grid],
+                    "lr": training_args.t_grid_lr_init * self.spatial_lr_scale,
+                    "name": "t_grid",
+                }
+            ],
+            lr=0, 
+            eps=1e-15, 
+            amsgrad=True
+        )
+
+
         self.xyz_scheduler_args = get_expon_lr_func(
             lr_init=training_args.position_lr_init * self.spatial_lr_scale,
             lr_final=training_args.position_lr_final * self.spatial_lr_scale,
@@ -289,6 +406,19 @@ class GaussianModel:
             max_steps=training_args.period_lr_max_steps,
         )
 
+        self.v_grid_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.v_grid_lr_init * self.spatial_lr_scale,
+            lr_final=training_args.v_grid_lr_final * self.spatial_lr_scale,
+            max_steps=training_args.v_grid_lr_max_steps,
+        )
+        self.t_grid_scheduler_args = get_expon_lr_func(
+            lr_init=training_args.t_grid_lr_init * self.spatial_lr_scale,
+            lr_final=training_args.t_grid_lr_final * self.spatial_lr_scale,
+            max_steps=training_args.t_grid_lr_max_steps,
+        )
+
+
+
     def update_learning_rate(self, iteration):
         """Learning rate scheduling per step"""
         for param_group in self.optimizer.param_groups:
@@ -313,6 +443,14 @@ class GaussianModel:
             if param_group["name"] == "period":
                 lr = self.period_scheduler_args(iteration)
                 param_group['lr'] = lr
+
+        for param_group in self.deformation_optimizer.param_groups:
+            if param_group["name"] == "v_grid":
+                lr = self.v_grid_scheduler_args(iteration)
+                param_group["lr"] = lr
+            if param_group["name"] == "t_grid":
+                lr = self.t_grid_scheduler_args(iteration)
+                param_group["lr"] = lr
 
     def construct_list_of_attributes(self):
         l = ["x", "y", "z", "nx", "ny", "nz"]
@@ -359,6 +497,8 @@ class GaussianModel:
         scale = t2a(self._scaling)
         rotation = t2a(self._rotation)
         period = t2a(self.period)
+        v_grid = t2a(self._v_grid)
+        t_grid = t2a(self._t_grid)
 
         out = {
             "xyz": xyz,
@@ -367,6 +507,8 @@ class GaussianModel:
             "rotation": rotation,
             "scale_bound": self.scale_bound,
             "period": period,
+            "v_grid": v_grid,
+            "t_grid": t_grid,
         }
         with open(path, "wb") as f:
             pickle.dump(out, f, pickle.HIGHEST_PROTOCOL)
@@ -406,6 +548,19 @@ class GaussianModel:
             ).requires_grad_(True)
         )
         self.period = nn.Parameter(torch.FloatTensor([2.8]).cuda().requires_grad_(True))
+
+
+        self._v_grid = nn.Parameter( 
+            torch.tensor(
+                data["v_grid"], dtype=torch.float, device="cuda"
+            ).requires_grad_(True)
+        )
+        self._t_grid = nn.Parameter(
+            torch.tensor(
+                data["t_grid"], dtype=torch.float, device="cuda"
+            ).requires_grad_(True)
+        )
+
         self.scale_bound = data["scale_bound"]
         self.setup_functions()  # Reset activation functions
 
@@ -430,6 +585,7 @@ class GaussianModel:
             if len(group["params"]) > 1:
                 continue
             if group["name"]=='period':continue
+            if group["name"] == "v_grid":continue
             stored_state = self.optimizer.state.get(group["params"][0], None)
             if stored_state is not None:
                 stored_state["exp_avg"] = stored_state["exp_avg"][mask]
@@ -447,6 +603,32 @@ class GaussianModel:
                     group["params"][0][mask].requires_grad_(True)
                 )
                 optimizable_tensors[group["name"]] = group["params"][0]
+
+
+        if not self.bspline:
+            for group in self.deformation_optimizer.param_groups:
+                if group["name"] == "v_grid":
+                    stored_state = self.deformation_optimizer.state.get(group["params"][0], None)
+                    if stored_state is not None:
+                        stored_state["exp_avg"] = stored_state["exp_avg"][mask]
+                        stored_state["exp_avg_sq"] = stored_state["exp_avg_sq"][mask]
+                        stored_state["max_exp_avg_sq"] = stored_state["max_exp_avg_sq"][mask]
+
+                        del self.deformation_optimizer.state[group["params"][0]]
+                        group["params"][0] = nn.Parameter(
+                            (group["params"][0][mask].requires_grad_(True))
+                        )
+                        self.deformation_optimizer.state[group["params"][0]] = stored_state
+
+                        optimizable_tensors[group["name"]] = group["params"][0]
+                    else:
+                        group["params"][0] = nn.Parameter(
+                            group["params"][0][mask].requires_grad_(True)
+                        )
+                        optimizable_tensors[group["name"]] = group["params"][0]
+
+
+
         return optimizable_tensors
 
     def prune_points(self, mask):
@@ -457,6 +639,10 @@ class GaussianModel:
         self._density = optimizable_tensors["density"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        if not self.bspline:
+            self._v_grid = optimizable_tensors["v_grid"]
+
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -471,6 +657,7 @@ class GaussianModel:
         for group in self.optimizer.param_groups:
             if len(group["params"])>1:continue
             if group["name"]=='period':continue
+            if group["name"] == "v_grid":continue
             assert len(group["params"]) == 1
             extension_tensor = tensors_dict[group["name"]]
             stored_state = self.optimizer.state.get(group["params"][0], None)
@@ -500,6 +687,43 @@ class GaussianModel:
                 )
                 optimizable_tensors[group["name"]] = group["params"][0]
 
+
+        if not self.bspline:
+            for group in self.deformation_optimizer.param_groups:
+                if group["name"] == "v_grid":
+                    assert len(group["params"]) == 1
+                    extension_tensor = tensors_dict[group["name"]]
+                    stored_state = self.deformation_optimizer.state.get(group["params"][0], None)
+                    if stored_state is not None:
+                        stored_state["exp_avg"] = torch.cat(
+                            (stored_state["exp_avg"], torch.zeros_like(extension_tensor)), dim=0
+                        )
+                        stored_state["exp_avg_sq"] = torch.cat(
+                            (stored_state["exp_avg_sq"], torch.zeros_like(extension_tensor)),
+                            dim=0,
+                        )
+                        stored_state["max_exp_avg_sq"] = torch.cat(
+                            (stored_state["max_exp_avg_sq"], torch.zeros_like(extension_tensor)),
+                            dim=0,
+                        )
+
+                        del self.deformation_optimizer.state[group["params"][0]]
+                        group["params"][0] = nn.Parameter(
+                            torch.cat(
+                                (group["params"][0], extension_tensor), dim=0
+                            ).requires_grad_(True)
+                        )
+                        self.deformation_optimizer.state[group["params"][0]] = stored_state
+
+                        optimizable_tensors[group["name"]] = group["params"][0]
+                    else:
+                        group["params"][0] = nn.Parameter(
+                            torch.cat(
+                                (group["params"][0], extension_tensor), dim=0
+                            ).requires_grad_(True)
+                        )
+                        optimizable_tensors[group["name"]] = group["params"][0]
+
         return optimizable_tensors
 
     def densification_postfix(
@@ -510,6 +734,7 @@ class GaussianModel:
         new_rotation,
         new_max_radii2D,
         new_deformation_table,
+        new_v_grid=None,
     ):
         d = {
             "xyz": new_xyz,
@@ -518,11 +743,17 @@ class GaussianModel:
             "rotation": new_rotation,
         }
 
+        if not self.bspline:
+            d["v_grid"] = new_v_grid
+
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
         self._density = optimizable_tensors["density"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
+
+        if not self.bspline:
+            self._v_grid = optimizable_tensors["v_grid"]
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -560,6 +791,10 @@ class GaussianModel:
         new_max_radii2D = self.max_radii2D[selected_pts_mask].repeat(N)
         new_deformation_table = self._deformation_table[selected_pts_mask].repeat(N)
 
+        new_v_grid = None
+        if not self.bspline:
+            new_v_grid = self._v_grid[selected_pts_mask].repeat(N, 1, 1)
+
         self.densification_postfix(
             new_xyz,
             new_density,
@@ -567,6 +802,7 @@ class GaussianModel:
             new_rotation,
             new_max_radii2D,
             new_deformation_table,
+            new_v_grid,
         )
 
         prune_filter = torch.cat(
@@ -600,6 +836,10 @@ class GaussianModel:
 
         new_deformation_table = self._deformation_table[selected_pts_mask]
 
+        new_v_grid = None
+        if not self.bspline:
+            new_v_grid = self._v_grid[selected_pts_mask]
+
         self.densification_postfix(
             new_xyz,
             new_densities,
@@ -607,6 +847,7 @@ class GaussianModel:
             new_rotation,
             new_max_radii2D,
             new_deformation_table,
+            new_v_grid,
         )
 
     @property
@@ -726,4 +967,97 @@ class GaussianModel:
         return total
     
     def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
+        # plane_loss = plane_tv_weight * self._plane_regulation() 
+        # time_loss =  time_smoothness_weight * self._time_regulation()
+        # time_plane_loss = l1_time_planes_weight * self._l1_regulation()
+        # total_loss = plane_loss + time_loss + time_plane_loss
+
+        # return total_loss, plane_loss, time_loss, time_plane_loss
+
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
+    
+    
+    def interpolation_plane(self):
+        L = self._deformation.deformation_net.grid.grids[0][2].shape[2]
+        T = math.ceil(math.exp(self.period.detach().item()))
+        self.valid_length = L - T
+
+        t = torch.arange(0, self.valid_length).cuda()
+        t_periodic = t + T
+
+        self.t_floor = torch.floor(t_periodic).long()    # 向下取整，比如 20.7 -> 20
+        self.t_ceil = torch.ceil(t_periodic).long()      # 向上取整，比如 20.7 -> 21
+        self.w_ceil = t_periodic - self.t_floor   # 比如 20.7 - 20 = 0.7
+        self.w_floor = 1 - self.w_ceil           # 比如 1 - 0.7 = 0.3
+
+        # 4. 准备权重的维度以便广播
+        # 假设 features 形状是 [32, 64, 100]
+        # w_floor 从 [80] 变成 [1, 1, 80]
+        self.w_floor = self.w_floor.view([1, 1, -1, 1])  # 更直观的写法
+        self.w_ceil = self.w_ceil.view([1, 1, -1, 1])
+
+    def compute_period_smoothness(self, grid):
+        features_periodic = (
+        grid[:, :, self.t_floor, :] * self.w_floor +  # 左侧点的加权值
+        grid[:, :, self.t_ceil, :] * self.w_ceil      # 右侧点的加权值
+    )
+        return F.mse_loss(grid[:, :, :self.valid_length, :], features_periodic).mean()
+
+    def period_regulation(self, period_regulation_weight):
+        multi_res_grids = self._deformation.deformation_net.grid.grids
+        total = 0
+        # model.grids is 6 x [1, rank * F_dim, reso, reso]
+        for grids in multi_res_grids:
+            if len(grids) == 3:
+                time_grids = []
+            else:
+                time_grids =[2, 4, 5]
+            for grid_id in time_grids:
+                total += self.compute_period_smoothness(grids[grid_id])
+
+        return period_regulation_weight * total
+    
+    
+    
+    def phase_aware_periodic_loss(self, features):
+        phase = 2 * torch.pi * (self.t_seq % torch.exp(self.period)) / torch.exp(self.period)  # 归一化到[0, 2π]
+        
+        # 生成正弦和余弦特征
+        # 返回形状为[2, 150]的tensor
+        # [0]: cos特征
+        # [1]: sin特征
+        phase_features = torch.stack([
+            torch.cos(phase),  # 周期性余弦信号
+            torch.sin(phase)   # 周期性正弦信号  
+        ])
+        
+       # 计算特征与相位的相关性
+        # features: [1, 32, 150, 64]
+        # phase_features: [2, 150]
+        # 输出 phase_correlation: [1, 32, 2, 64]
+        phase_correlation = torch.einsum('bcts,pt->bcps', features, phase_features)
+        
+        # 重建周期信号
+        # phase_correlation: [1, 32, 2, 64]
+        # phase_features: [2, 150]
+        # 输出 periodic_signal: [1, 32, 150, 64]
+        periodic_signal = torch.einsum('bcps,pt->bcts', phase_correlation, phase_features)
+        
+        # 计算重建损失
+        reconstruction_loss = F.mse_loss(features, periodic_signal).mean()
+        
+        return reconstruction_loss
+    
+    def period_reconstruction(self, period_construction_weight):
+        multi_res_grids = self._deformation.deformation_net.grid.grids
+        total = 0
+        # model.grids is 6 x [1, rank * F_dim, reso, reso]
+        for grids in multi_res_grids:
+            if len(grids) == 3:
+                time_grids = []
+            else:
+                time_grids =[2, 4, 5]
+            for grid_id in time_grids:
+                total += self.phase_aware_periodic_loss(grids[grid_id])
+
+        return period_construction_weight * total

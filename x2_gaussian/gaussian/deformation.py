@@ -9,9 +9,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-from x2_gaussian.gaussian.graphics_utils import apply_rotation, batch_quaternion_multiply
-from x2_gaussian.gaussian.hexplane import HexPlaneField
-from x2_gaussian.gaussian.grid import DenseGrid
+from r2_gaussian.gaussian.graphics_utils import apply_rotation, batch_quaternion_multiply
+from r2_gaussian.gaussian.hexplane import HexPlaneField
+from r2_gaussian.gaussian.grid import DenseGrid
 # from scene.grid import HashHexPlane
 class Deformation(nn.Module):
     def __init__(self, D=8, W=256, input_ch=27, input_ch_time=9, grid_pe=0, skips=[], args=None):
@@ -21,8 +21,8 @@ class Deformation(nn.Module):
         self.input_ch = input_ch
         self.input_ch_time = input_ch_time
         self.skips = skips
-        self.grid_pe = grid_pe
-        self.no_grid = args.no_grid
+        self.grid_pe = grid_pe  # 0 useless
+        self.no_grid = args.no_grid  # False
         self.grid = HexPlaneField(args.bounds, args.kplanes_config, args.multires)
         # breakpoint()
         self.args = args
@@ -66,14 +66,15 @@ class Deformation(nn.Module):
 
     def query_time(self, rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb):
 
-        if self.no_grid:
+        if self.no_grid:  # False
             h = torch.cat([rays_pts_emb[:,:3],time_emb[:,:1]],-1)
-        else:
+        else:   # USE THIS
 
             grid_feature = self.grid(rays_pts_emb[:,:3], time_emb[:,:1])
-            # breakpoint()
-            if self.grid_pe > 1:
+
+            if self.grid_pe > 1:  # 0 useless
                 grid_feature = poc_fre(grid_feature,self.grid_pe)
+
             hidden = torch.cat([grid_feature],-1) 
         
         
@@ -95,37 +96,50 @@ class Deformation(nn.Module):
         dx = self.static_mlp(grid_feature)
         return rays_pts_emb[:, :3] + dx
     def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, density_emb, time_feature, time_emb):
+        # time1 = time.time()
         hidden = self.query_time(rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb)
-        if self.args.static_mlp:
+        # time2 = time.time()
+        # print("time1: ", time2-time1) 0.0011394023895263672
+
+        if self.args.static_mlp:  # useless
             mask = self.static_mlp(hidden)
-        elif self.args.empty_voxel:
+        elif self.args.empty_voxel:  # useless
             mask = self.empty_voxel(rays_pts_emb[:,:3])
-        else:
+        else:  # USE THIS
             mask = torch.ones_like(density_emb[:,0]).unsqueeze(-1)
         # breakpoint()
+
         if self.args.no_dx:
             pts = rays_pts_emb[:,:3]
         else:
+            # time3 = time.time()
             dx = self.pos_deform(hidden) # [50000, 3]
+            # time4 = time.time()
+            # print("time2: ", time4-time3)  4.982948303222656e-05
             # breakpoint()
             pts = torch.zeros_like(rays_pts_emb[:,:3])
             pts = rays_pts_emb[:,:3]*mask + dx
-        if self.args.no_ds :
-            
+
+        if self.args.no_ds :   
             scales = scales_emb[:,:3]
         else:
+            # time5 = time.time()
             ds = self.scales_deform(hidden)
-
+            # time6 = time.time()
+            # print("time3: ", time6-time5)    3.790855407714844e-05
             scales = torch.zeros_like(scales_emb[:,:3])
             scales = scales_emb[:,:3]*mask + ds
             
         if self.args.no_dr :
             rotations = rotations_emb[:,:4]
         else:
+            # time7 = time.time()
             dr = self.rotations_deform(hidden)
-
+            # time8 = time.time()
+            # print("time4: ", time8-time7)     3.7670135498046875e-05
             rotations = torch.zeros_like(rotations_emb[:,:4])
-            if self.args.apply_rotation:
+
+            if self.args.apply_rotation:   # useless
                 rotations = batch_quaternion_multiply(rotations_emb, dr)
             else:
                 rotations = rotations_emb[:,:4] + dr
@@ -164,7 +178,7 @@ class deform_network(nn.Module):
         density_pe = args.density_pe
         timenet_width = args.timenet_width
         timenet_output = args.timenet_output
-        grid_pe = args.grid_pe
+        grid_pe = args.grid_pe  # 0 useless
         times_ch = 2*timebase_pe+1
         self.timenet = nn.Sequential(
         nn.Linear(times_ch, timenet_width), nn.ReLU(),

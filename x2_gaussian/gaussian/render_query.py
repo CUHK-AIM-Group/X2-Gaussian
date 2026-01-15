@@ -20,9 +20,9 @@ from xray_gaussian_rasterization_voxelization import (
 import time as timeku
 
 sys.path.append("./")
-from x2_gaussian.gaussian.gaussian_model import GaussianModel
-from x2_gaussian.dataset.cameras import Camera
-from x2_gaussian.arguments import PipelineParams
+from r2_gaussian.gaussian.gaussian_model import GaussianModel
+from r2_gaussian.dataset.cameras import Camera
+from r2_gaussian.arguments import PipelineParams
 
 
 def query(
@@ -63,19 +63,37 @@ def query(
     rotations = None
     cov3D_precomp = None
     if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
+        cov3D_precomp  = pc.get_covariance(scaling_modifier)
     else:
-        # scales = pc.get_scaling
-        # rotations = pc.get_rotation
         scales = pc._scaling
         rotations = pc._rotation
 
     if stage=='coarse':
         means3D_final, scales_final, rotations_final = means3D, scales, rotations
-    else:
+        scales_final = pc.scaling_activation(scales_final)
+        rotations_final = pc.rotation_activation(rotations_final)
+    elif stage=='fine':
         means3D_final, scales_final, rotations_final = pc._deformation(means3D, scales, rotations, density, time)
-    scales_final = pc.scaling_activation(scales_final)
-    rotations_final = pc.rotation_activation(rotations_final)
+        scales_final = pc.scaling_activation(scales_final)
+        rotations_final = pc.rotation_activation(rotations_final)
+    else:
+        if not pipe.no_bspline:
+            if pipe.unified:
+                means3D_final, jacobians = pc.deformation(means3D, time[0][0]) 
+                cov3D_precomp, scales_final = pc.get_covariance(scaling_modifier, jacobians, returnEigen=True)
+                rotations_final = None
+            else:
+                delta = pc.deformation(means3D, time[0][0])
+                means3D_final = means3D + delta[:,:3]
+                scales_final = pc.scaling_activation(scales + delta[:,3:6])
+                rotations_final = pc.rotation_activation(rotations + delta[:,6:])
+                cov3D_precomp = None
+        else:
+            delta = pc.deformation(means3D, time[0][0])
+            means3D_final = means3D + delta[:,:3]
+            scales_final = pc.scaling_activation(scales + delta[:,3:6])
+            rotations_final = pc.rotation_activation(rotations + delta[:,6:])
+            cov3D_precomp = None
 
     vol_pred, radii = voxelizer(
         means3D=means3D_final,
@@ -160,15 +178,31 @@ def render(
         scales = pc._scaling
         rotations = pc._rotation
 
-    # neg_inf_mask = torch.isinf(scales)
-    # if neg_inf_mask.sum() > 0:
-    #     print('scales inf !!!')
+
+    jacobians = None
 
     if stage=='coarse':
         means3D_final, scales_final, rotations_final = means3D, scales, rotations
-    else:
-        # breakpoint()
+    elif stage=='fine':
         means3D_final, scales_final, rotations_final = pc._deformation(means3D, scales, rotations, density, time)
+    else:
+        if not pipe.no_bspline:
+            if pipe.unified:
+                means3D_final, jacobians = pc.deformation(means3D, time[0][0])
+                scales_final = scales
+                rotations_final = rotations
+            else:
+                delta = pc.deformation(means3D, time[0][0])
+                means3D_final = means3D + delta[:,:3]
+                scales_final = scales + delta[:,3:6]
+                rotations_final = rotations + delta[:,6:]
+        else:
+            delta = pc.deformation(means3D, time[0][0])
+            means3D_final = means3D + delta[:,:3]
+            scales_final = scales + delta[:,3:6]
+            rotations_final = rotations + delta[:,6:]
+
+
     scales_final = pc.scaling_activation(scales_final)
     rotations_final = pc.rotation_activation(rotations_final)
 
@@ -180,6 +214,7 @@ def render(
         scales=scales_final,
         rotations=rotations_final,
         cov3D_precomp=cov3D_precomp,
+        # deformJacobians=jacobians,
     )
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria. 
@@ -189,6 +224,7 @@ def render(
         "visibility_filter": radii > 0,
         "radii": radii,
     }
+
 
 def render_prior_oneT(
     viewpoint_camera: Camera,

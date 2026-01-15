@@ -15,4 +15,5 @@ tensorboardX==2.6.2.2
 tqdm==4.66.5
 pydicom
 pyvista
+pytorch_wavelets
 Cython==0.29.36

@@ -1,3 +1,14 @@
+#
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
+#
+# This software is free for non-commercial, research and evaluation use
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
 import os
 import os.path as osp
 import torch
@@ -7,18 +18,20 @@ from tqdm import tqdm
 from argparse import ArgumentParser
 import numpy as np
 import yaml
+import time
 import math
 
 sys.path.append("./")
-from x2_gaussian.arguments import ModelParams, OptimizationParams, PipelineParams, ModelHiddenParams
-from x2_gaussian.gaussian import GaussianModel, render, query, initialize_gaussian, render_prior_oneT
-from x2_gaussian.utils.general_utils import safe_state
-from x2_gaussian.utils.cfg_utils import load_config
-from x2_gaussian.utils.log_utils import prepare_output_and_logger
-from x2_gaussian.dataset import Scene
-from x2_gaussian.utils.loss_utils import l1_loss, ssim, tv_3d_loss
-from x2_gaussian.utils.image_utils import metric_vol, metric_proj
-from x2_gaussian.utils.plot_utils import show_two_slice
+from r2_gaussian.arguments import ModelParams, OptimizationParams, PipelineParams, ModelHiddenParams
+from r2_gaussian.gaussian import GaussianModel, render, query, initialize_gaussian, render_prior_oneT
+from r2_gaussian.utils.general_utils import safe_state
+from r2_gaussian.utils.cfg_utils import load_config
+from r2_gaussian.utils.log_utils import prepare_output_and_logger
+from r2_gaussian.dataset import Scene
+from r2_gaussian.utils.loss_utils import l1_loss, ssim, tv_3d_loss, WaveletLoss
+from r2_gaussian.utils.image_utils import metric_vol, metric_proj
+from r2_gaussian.utils.plot_utils import show_two_slice
+
 
 def training(
     dataset: ModelParams,
@@ -31,6 +44,9 @@ def training(
     checkpoint_iterations,
     checkpoint,
     coarse_iter,
+    fine_low_iter,
+    load_iter,
+    load_path,
 ):
     # Set up dataset
     scene = Scene(dataset, shuffle=False)
@@ -46,39 +62,37 @@ def training(
     # Set up Gaussians
     gaussians = GaussianModel(scale_bound, hyper)
     initialize_gaussian(gaussians, dataset, None)
+
+    gaussians.setup_v_grid(scanner_cfg, dataset, pipe.unified, pipe.no_bspline!=True)
+    gaussians.setup_t_grid(len(scene.getTrainCameras()), dataset)
+
     scene.gaussians = gaussians
 
-    scene_reconstruction(
-        dataset,
-        opt,
-        pipe,
-        hyper,
-        tb_writer,
-        testing_iterations,
-        saving_iterations,
-        checkpoint_iterations,
-        checkpoint,
-        coarse_iter,
-        gaussians,
-        scene,
-        'coarse',
-    )
+    if not load_iter: 
+        stages = ['coarse', 'fine', 'fine_high']
+    else:
+        if load_iter < coarse_iter: stages = ['coarse', 'fine', 'fine_high']
+        elif load_iter >= coarse_iter and load_iter < fine_low_iter: stages = ['fine', 'fine_high']
+        elif load_iter >= fine_low_iter: stages = ['fine_high']
 
-    scene_reconstruction(
-        dataset,
-        opt,
-        pipe,
-        hyper,
-        tb_writer,
-        testing_iterations,
-        saving_iterations,
-        checkpoint_iterations,
-        checkpoint,
-        coarse_iter,
-        gaussians,
-        scene,
-        'fine',
-    )
+    for stage in stages:
+        scene_reconstruction(
+            dataset,
+            opt,
+            pipe,
+            hyper,
+            tb_writer,
+            testing_iterations,
+            saving_iterations,
+            checkpoint_iterations,
+            checkpoint,
+            coarse_iter,
+            gaussians,
+            scene,
+            stage,
+            fine_low_iter,
+            load_iter,
+        )
 
 
 def scene_reconstruction(
@@ -95,6 +109,8 @@ def scene_reconstruction(
     gaussians,
     scene,
     stage,
+    fine_low_iter,
+    load_iter,
 ):
     
     scanner_cfg = scene.scanner_cfg
@@ -131,11 +147,26 @@ def scene_reconstruction(
         tv_vol_sVoxel = torch.tensor(scanner_cfg["dVoxel"]) * tv_vol_nVoxel
 
     if stage == 'coarse':
-        train_iterations = coarse_iter
-        first_iter = 0
-    else:
-        train_iterations = opt.iterations
-        first_iter = coarse_iter
+        if load_iter: 
+            train_iterations = coarse_iter
+            first_iter = load_iter
+        else:
+            train_iterations = coarse_iter
+            first_iter = 0
+    elif stage == 'fine':
+        if load_iter: 
+            train_iterations = fine_low_iter
+            first_iter = load_iter
+        else:
+            train_iterations = fine_low_iter
+            first_iter = coarse_iter
+    elif stage == 'fine_high':
+        if load_iter: 
+            train_iterations = opt.iterations
+            first_iter = load_iter
+        else:
+            train_iterations = opt.iterations
+            first_iter = fine_low_iter
 
     # Train
     iter_start = torch.cuda.Event(enable_timing=True)
@@ -146,6 +177,8 @@ def scene_reconstruction(
     progress_bar = tqdm(range(0, train_iterations), desc="Train", leave=False)
     progress_bar.update(first_iter)
     first_iter += 1
+
+    wavelet_loss_fn = WaveletLoss(wavelet='db1', level=1, alpha=10.0).cuda()
 
     for iteration in range(first_iter, train_iterations + 1):
         iter_start.record()
@@ -170,7 +203,9 @@ def scene_reconstruction(
         # Compute loss
         gt_image = viewpoint_cam.original_image.cuda()
         loss = {"total": 0.0}
-        render_loss = l1_loss(image, gt_image)
+
+        render_loss = wavelet_loss_fn(image, gt_image) + l1_loss(image, gt_image)
+
         loss["render"] = render_loss
         loss["total"] += loss["render"]
         if opt.lambda_dssim > 0:
@@ -178,12 +213,11 @@ def scene_reconstruction(
             loss["dssim"] = loss_dssim
             loss["total"] = loss["total"] + opt.lambda_dssim * loss_dssim
 
-
         # Prior loss
         if stage=='fine' and iteration > 7000:
             render_pkg_prior = render_prior_oneT(viewpoint_cam, gaussians, pipe, stage)
             image_prior = render_pkg_prior["render"]    
-            render_loss_prior = l1_loss(image_prior, gt_image)
+            render_loss_prior = wavelet_loss_fn(image_prior, gt_image) + l1_loss(image_prior, gt_image)
             loss["render_prior"] = render_loss_prior
             loss["total"] += opt.lambda_prior * loss["render_prior"]
             if opt.lambda_dssim > 0:
@@ -191,8 +225,11 @@ def scene_reconstruction(
                 loss["dssim_prior"] = loss_dssim_prior
                 loss["total"] = loss["total"] + opt.lambda_prior * opt.lambda_dssim * loss_dssim_prior
 
+
+        use_fdk_loss = False
+
         # 3D TV loss
-        if use_tv:
+        if use_tv and (not use_fdk_loss):
             # Randomly get the tiny volume center
             tv_vol_center = (bbox[0] + tv_vol_sVoxel / 2) + (
                 bbox[1] - tv_vol_sVoxel - bbox[0]
@@ -210,13 +247,10 @@ def scene_reconstruction(
             loss["tv"] = loss_tv
             loss["total"] = loss["total"] + opt.lambda_tv * loss_tv
 
-        # 4D TV loss
-        if hyper.time_smoothness_weight != 0 and stage=='fine':
-            tv_loss_4d = gaussians.compute_regulation(hyper.time_smoothness_weight, hyper.l1_time_planes, hyper.plane_tv_weight)
-            loss["4d_tv"] = tv_loss_4d
-            loss["total"] = loss["total"] + tv_loss_4d
 
         loss["total"].backward()
+
+    
         iter_end.record()
         torch.cuda.synchronize()
 
@@ -245,11 +279,13 @@ def scene_reconstruction(
                 raise ValueError(
                     "No Gaussian left. Change adaptive control hyperparameters!"
                 )
-
+            
             # Optimization
             if iteration < train_iterations:
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none=True)
+                gaussians.deformation_optimizer.step()
+                gaussians.deformation_optimizer.zero_grad(set_to_none=True)
 
             # Save gaussians
             if iteration in saving_iterations or iteration == train_iterations:
@@ -282,6 +318,8 @@ def scene_reconstruction(
                 metrics["loss_" + l] = loss[l].item()
             for param_group in gaussians.optimizer.param_groups:
                 metrics[f"lr_{param_group['name']}"] = param_group["lr"]
+            for param_group in gaussians.deformation_optimizer.param_groups:
+                metrics[f"lr_{param_group['name']}"] = param_group["lr"]
 
             metrics['period'] = math.exp(gaussians.period.item())
 
@@ -296,6 +334,9 @@ def scene_reconstruction(
                 queryfunc,
                 stage,
             )
+
+      
+
 
 def training_report(
     tb_writer,
@@ -393,8 +434,8 @@ def training_report(
                     )
 
         # Evaluate 3D reconstruction performance
-        breath_cycle = 3.0  # breath period
-        num_phases = 10  # phase numbers
+        breath_cycle = 3.0  # 呼吸周期
+        num_phases = 10  # 相位数
         phase_time = breath_cycle / num_phases
         mid_phase_time = phase_time / 2
         scanTime = 60.0
@@ -483,13 +524,17 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)
     parser.add_argument("--config", type=str, default=None)
-    parser.add_argument("--coarse_iter", type=int, default=5000)
+    parser.add_argument("--coarse_iter", type=int, default=0)
+    parser.add_argument("--fine_low_iter", type=int, default=30000)
     parser.add_argument("--dirname", type=str, default="DEBUG")
+    parser.add_argument("--load_iter", type=int, default=None)
+    parser.add_argument("--load_path", type=str, default=None)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     args.test_iterations.append(args.iterations)
     args.test_iterations.append(1)
     # fmt: on
+
 
     dirname = args.dirname
 
@@ -521,6 +566,9 @@ if __name__ == "__main__":
         args.checkpoint_iterations,
         args.start_checkpoint,
         args.coarse_iter,
+        args.fine_low_iter,
+        args.load_iter,
+        args.load_path,
     )
 
     # All done

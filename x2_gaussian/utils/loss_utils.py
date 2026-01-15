@@ -14,6 +14,30 @@ import torch.nn.functional as F
 from torch.autograd import Variable
 from math import exp
 import torch.nn as nn
+from torchvision.transforms.functional import gaussian_blur
+from pytorch_wavelets import DWTForward
+
+    
+class WaveletLoss(nn.Module):
+    def __init__(self, wavelet='db1', level=1, alpha=10.0):
+        super().__init__()
+
+        self.level = level
+        self.alpha = alpha
+        self.dwt = DWTForward(J=self.level, wave=wavelet, mode='symmetric')
+
+
+    def forward(self, rendered_images, real_images):
+        Yl_rendered, Yh_rendered = self.dwt(rendered_images.unsqueeze(0))
+        Yl_real, Yh_real = self.dwt(real_images.unsqueeze(0))
+        total_loss = 0.
+
+        for i in range(self.level):
+            loss_detail = l1_loss(Yh_rendered[i][:,:,1], Yh_real[i][:,:,1])   
+            total_loss += self.alpha * loss_detail
+        
+        return total_loss
+
 
 
 def tv_3d_loss(vol, reduction="sum"):
@@ -37,6 +61,8 @@ def tv_3d_loss(vol, reduction="sum"):
 def l1_loss(network_output, gt):
     return torch.abs((network_output - gt)).mean()
 
+def l1_loss_full(network_output, gt):
+    return torch.abs((network_output - gt))
 
 def l2_loss(network_output, gt):
     return ((network_output - gt) ** 2).mean()
