@@ -1,4 +1,5 @@
 # [ICCV 2025] X2-Gaussian: 4D Radiative Gaussian Splatting for Continuous-time Tomographic Reconstruction
+# [In submission] X2-Gaussian++: Advancing 4D Radiative Gaussian Splatting for Continuous-time Tomographic Reconstruction
 
 ### [Project Page](https://x2-gaussian.github.io/) | [Paper](https://arxiv.org/abs/2503.21779)
 
@@ -26,17 +27,12 @@ X2-Gaussian demonstrates state-of-the-art reconstruction performance.
 
 ## News
 
+* 2026.01.15: Training code for X2-Gaussian++ has been released. Welcome to have a try!
 * 2025.10.27: Datasets have been released [here](https://huggingface.co/datasets/vortex778/X2GS). Welcome to have a try!
-* 2025.10.17: Training code has been released.
-* 2025.06.26: Our work has been accepted to ICCV 2025.
-* 2025.03.27: Our paper is available on [arxiv](https://arxiv.org/abs/2503.21779).
+* 2025.10.17: Training code for X2-Gaussian has been released.
+* 2025.06.26: X2-Gaussian has been accepted to ICCV 2025.
+* 2025.03.27: X2-Gaussian is available on [arxiv](https://arxiv.org/abs/2503.21779).
 
-## TODO
-
-- [ ] Release more detailed instructions.
-- [ ] Release data generation code.
-- [ ] Release evaluation code.
-- [ ] Release visualizaton code.
 
 ## Installation
 
@@ -61,7 +57,7 @@ unzip v2.3.zip
 pip install TIGRE-2.3/Python --no-build-isolation
 ```
 
-## Training
+## Training X2-Gaussian++
 
 ### Dtaset
 
@@ -88,6 +84,10 @@ python train.py -s <path to data>
 # Example
 python train.py -s XXX/*.pickle  
 ```
+
+## Training X2-Gaussian
+
+Please refer [here](https://github.com/yuyouxixi/x2-gaussian)
 
 ## Citation
 
